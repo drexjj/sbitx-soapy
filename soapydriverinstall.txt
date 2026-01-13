@@ -1,0 +1,44 @@
+Burn 5.0 image
+sudo apt update
+
+Sbitx_ctrl install
+open terminal
+
+copy sbitx-core_mod to where it will run
+build sbitx_ctrl
+sudo apt install libi2c-dev 
+gcc -O2 -pthread -o sbitx_ctrl  sbitx_ctrl.c sbitx_core.c sbitx_gpio.c sbitx_i2c.c sbitx_si5351.c   -lwiringPi -li2c
+run it  ./sbitx_ctrl
+If you want to test sbitx_ctrl install
+sudo apt install netcat-traditional
+run nc 127.0.0.1 9999
+f  --view freq
+F 14200000 to set freq to 14.200mhz
+T 1 set ptt
+T 0 rx
+t ptt status
+
+
+Soapy driver install
+first install
+sudo apt install -y soapysdr-tools libsoapysdr-dev
+sudo apt install libliquid-dev
+
+
+go to  soapysbitx_driver_liquid folder
+mkdir -p build
+cd build
+cmake ..
+make -j2
+sudo make install
+sudo ldconfig
+
+Test driver install
+SoapySDRUtil --info
+
+install pihpsdr dl1ycf
+copy gpio.props file to ./config/pihpsdr if you start from the desktop icon, copy to the install folder if you start directly or from terminal.
+Since the default gpio settings access i2c and other gpio pins, wm8731 might lock and show no rx. After copy the gpio.props file, you might need to reboot the pi.
+If you dont run sbitx app first, then before running, you need to go to alsamixer and change capture from mic to line
+Need to use a usb headset or usb audio device. Sbitx speaker and mic are not yet integrated.
+
