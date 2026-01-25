@@ -108,7 +108,7 @@ sed -i \
     src/sliders.c
 
 echo "=== Building piHPSDR ==="
-make -C src -j$(nproc)
+make -C -j$(nproc)
 
 ###############################################################################
 # FINAL
