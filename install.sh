@@ -79,17 +79,33 @@ else
     cd pihpsdr
 fi
 
-cat <<EOF > Makefile.config
-GPIO=ON
-MIDI=ON
-SATURN=OFF
-USBOZY=OFF
-SOAPYSDR=ON
-STEMLAB=OFF
-AUDIO=ALSA
-NR34LIB=OFF
-TTS=OFF
+# Patch the Makefile to configure features the way we want
+if git diff --quiet Makefile; then
+    # generate the patch for the code
+    cat > Makefile.diff <<EOF
+--- a/Makefile
++++ b/Makefile
+@@ -12,11 +12,11 @@
+ #
+ #######################################################################################
+ 
+-GPIO=ON
++GPIO=OFF
+ MIDI=ON
+-SATURN=ON
++SATURN=OFF
+ USBOZY=OFF
+-SOAPYSDR=OFF
++SOAPYSDR=ON
+ STEMLAB=OFF
+ AUDIO=PULSE
+ NR34LIB=OFF
 EOF
+    # apply the patch for the code
+    patch -p1 < Makefile.diff
+else
+    echo "Makefile is already modified"
+fi
 
 echo "=== Copying props files ==="
 cp "$INSTALL_HOME/sbitx-soapy/pihpsdr_files/gpio.props" .
