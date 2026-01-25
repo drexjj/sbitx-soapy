@@ -1,0 +1,7 @@
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/SoapySBITX.dir
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/edit_cache.dir
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/rebuild_cache.dir
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/list_install_components.dir
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/install.dir
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/install/local.dir
+/home/pi/sbitx_soapy_pihpsdr_files/soapy_sbitx_driver/build/CMakeFiles/install/strip.dir

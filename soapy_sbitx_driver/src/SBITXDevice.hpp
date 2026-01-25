@@ -99,6 +99,7 @@ private:
         size_t channel;
     };
     
+    
     //std::atomic<float> txPaGain_{1.0f}; //linear pa drive
     //double txGainDb_ = 0.0; //tx if gain
     // ALSA
@@ -173,4 +174,45 @@ private:
     std::vector<int32_t> txFrames_;
     double txPhase_ = 0.0;
     double rxPhase_ = 0.0;
+private:
+// pihpsdr_path_b: bridge piHPSDR AF/MIC via ALSA loopback while driver owns WM8731
+std::string afLoopCapDev_ = "plughw:1,1";
+snd_pcm_t *afLoopCapHandle_{nullptr};
+std::thread afLoopThread_;
+std::atomic<bool> afLoopRun_{false};
+
+std::string micLoopPbDev_ = "plughw:2,1";
+snd_pcm_t *micLoopPbHandle_{nullptr};
+
+std::mutex pbMutex_;
+std::atomic<float> afGain_{0.2f};
+
+bool openAfLoopCapture();
+void closeAfLoopCapture();
+bool openMicLoopPlayback();
+void closeMicLoopPlayback();
+void startAfLoopThread();
+void stopAfLoopThread();
+void afLoopThreadMain();
+
+// ABI compatibility symbols
+void txWrite(const float *iq_interleaved, size_t n);
+void txRbWrite(const float *iq_interleaved, size_t n);
+private:
+// ---- Path-B MIC loopback (codec MIC -> loopback for piHPSDR) ----
+std::thread micLoopThread_;
+std::atomic<bool> micLoopRun_{false};
+
+// MIC ringbuffer @48k mono float
+std::vector<float> micRb_;
+size_t micRbSize_{0}, micRbHead_{0}, micRbTail_{0};
+std::mutex micRbMtx_;
+
+void micRbWrite(const float* in, size_t n);
+size_t micRbRead(float* out, size_t n);
+
+void startMicLoopThread();
+void stopMicLoopThread();
+void micLoopThreadMain();
+
 };

@@ -1,3 +1,4 @@
+#include <complex>
 #include "SBITXDevice.hpp"
 
 #include <SoapySDR/Logger.hpp>
@@ -91,6 +92,9 @@ SBITXDevice::SBITXDevice(const SoapySDR::Kwargs &args)
     alsaDev_ = args.count("alsa") ? args.at("alsa") : "hw:0,0";
 
     fs_ = 48000;
+
+    // MIC ringbuffer: 2 seconds @48k, stereo S32 (L=R=mic)
+
     capFs_ = args.count("capFs") ? (unsigned int)std::stoul(args.at("capFs")) : 96000;
     pbFs_  = args.count("pbFs")  ? (unsigned int)std::stoul(args.at("pbFs"))  : 96000;
 
@@ -129,6 +133,10 @@ SBITXDevice::SBITXDevice(const SoapySDR::Kwargs &args)
     rbSize_ = fs_ * 2; // 2 seconds ring buffer @48k
     rb_.assign(rbSize_, std::complex<float>(0, 0));
 
+
+    micRbSize_ = fs_ / 20 ; // 2 seconds @48k
+    micRb_.assign(micRbSize_, 0.0f);
+    micRbHead_ = micRbTail_ = 0;
     SoapySDR::logf(SOAPY_SDR_INFO,
         "SBITX: alsa=%s fs=%u capFs=%u pbFs=%u if=%.1f iq_swap=%d iq_inv=%d period=%lu buffer=%lu rt=%d ctrl=%s:%d (%s)",
         alsaDev_.c_str(), fs_, capFs_, pbFs_, ifHz_, (int)iqSwap_, (int)iqInv_,
@@ -138,6 +146,9 @@ SBITXDevice::SBITXDevice(const SoapySDR::Kwargs &args)
 
 SBITXDevice::~SBITXDevice()
 {
+    stopMicLoopThread();
+    stopAfLoopThread();
+    closeMicLoopPlayback();
     stopRxThread();
     closeAlsaCapture();
     closeAlsaPlayback();
@@ -240,9 +251,11 @@ SoapySDR::RangeList SBITXDevice::getFrequencyRange(const int, const size_t, cons
 std::vector<std::string> SBITXDevice::listGains(const int direction, const size_t) const
 {
     if (direction == SOAPY_SDR_TX) return {"PA"};
+    if (direction == SOAPY_SDR_RX) return {"RF Gain"};
     return {};
 }
-std::atomic<float> txPaGain_{255.0f}; //default full drive
+std::atomic<float> txPaGain_{100.0f}; //default full drive
+std::atomic<float> rfGain_{1.0f}; //linear rf gain
 SoapySDR::Range SBITXDevice::getGainRange(
     const int direction,
     const size_t,
@@ -250,6 +263,8 @@ SoapySDR::Range SBITXDevice::getGainRange(
 {
     if (direction == SOAPY_SDR_TX && name == "PA")
         return SoapySDR::Range(0.0, 100.0);
+    if (direction == SOAPY_SDR_RX && name == "RF Gain")
+        return SoapySDR::Range(0.0, 1.0, .010);
     return SoapySDR::Range();
 }
 
@@ -261,6 +276,8 @@ double SBITXDevice::getGain(
 {
     if (direction == SOAPY_SDR_TX && name == "PA")
         return (double)txPaGain_.load(std::memory_order_relaxed); // store raw 0..255
+    if (direction == SOAPY_SDR_RX && name == "RF Gain")
+        return (double)rfGain_.load(std::memory_order_relaxed); // store raw 0..255
     return 0.0;
 }
 
@@ -276,6 +293,12 @@ void SBITXDevice::setGain(
         txPaGain_.store(v, std::memory_order_relaxed);
         SoapySDR::logf(SOAPY_SDR_INFO, "TX Drive setGain: name=%s value=%f", name.c_str(), value);
     }
+    if (direction == SOAPY_SDR_RX && name == "RF Gain")
+    {
+        const float v = (float)std::clamp(value, 0.0, 1.0);
+        rfGain_.store(v, std::memory_order_relaxed);
+        SoapySDR::logf(SOAPY_SDR_INFO, "RF setGain: name=%s value=%f", name.c_str(), value);
+    }    
 }
 
 
@@ -431,13 +454,35 @@ void SBITXDevice::closeStream(SoapySDR::Stream *stream)
     delete s;
 }
 
-int SBITXDevice::activateStream(SoapySDR::Stream *stream, const int, const long long, const size_t)
+int SBITXDevice::activateStream(
+    SoapySDR::Stream *stream,
+    const int,
+    const long long,
+    const size_t)
 {
+    
     auto *s = reinterpret_cast<SBITXStream*>(stream);
-    if (s && s->direction == SOAPY_SDR_RX)
+
+    if (!s) return 0;
+
+    if (s->direction == SOAPY_SDR_TX)
+    {
+        fprintf(stderr, "TX stream activated\n");
+        fflush(stderr);
+
+        //txActive_.store(true);
+        startMicLoopThread();   // START ON TX STREAM
+        
+    }
+
+    if (s->direction == SOAPY_SDR_RX)
+    {
         startRxThread();
+    }
+
     return 0;
 }
+
 
 int SBITXDevice::deactivateStream(SoapySDR::Stream *stream, const int, const long long)
 {
@@ -452,13 +497,19 @@ int SBITXDevice::deactivateStream(SoapySDR::Stream *stream, const int, const lon
             const long long hw = (long long)std::llround((double)rf - ifHz_);
             (void)ctrlSetFreqHz(hw);
         }
-
+        fprintf(stderr, "TX stream deactivated\n");
+        fflush(stderr);
         txActive_.store(false);
-    }
+        micLoopRun_.store(false, std::memory_order_relaxed);
+        stopMicLoopThread();
+}
 
     if (s && s->direction == SOAPY_SDR_RX) {
+    // Keep codec capture alive during TX so MIC ringbuffer continues to fill
+    if (!txActive_.load(std::memory_order_relaxed)) {
         stopRxThread();
     }
+}
 
     return 0;
 }
@@ -483,6 +534,7 @@ int SBITXDevice::readStream(SoapySDR::Stream *, void * const *buffs, const size_
             std::chrono::steady_clock::now() - t0).count();
         if (dt > timeoutUs) return SOAPY_SDR_TIMEOUT;
     }
+    
 }
 
 
@@ -568,6 +620,7 @@ bool SBITXDevice::openAlsaPlayback()
     }
 
     snd_pcm_prepare(pbHandle_);
+    
     return true;
 }
 
@@ -581,7 +634,10 @@ void SBITXDevice::closeAlsaPlayback()
 
 void SBITXDevice::startRxThread()
 {
-    if (rxRun_.exchange(true)) return;
+       
+        startAfLoopThread();
+
+if (rxRun_.exchange(true)) return;
     rxThread_ = std::thread(&SBITXDevice::rxThreadMain, this);
 
 #ifdef __linux__
@@ -596,6 +652,8 @@ void SBITXDevice::startRxThread()
 
 void SBITXDevice::stopRxThread()
 {
+            stopMicLoopThread();
+            stopAfLoopThread();
     if (!rxRun_.exchange(false)) return;
     if (rxThread_.joinable()) rxThread_.join();
 }
@@ -661,6 +719,37 @@ void SBITXDevice::rxThreadMain()
             }
         if (got <= 0) continue;
 
+const size_t frames = (size_t)got;
+
+// ---- MIC extraction (RIGHT channel) ----
+{
+    const size_t outN = frames / 2;
+    static std::vector<float> mic48;
+    mic48.resize(outN);
+
+    size_t oi = 0;
+    for (size_t n = 0; n + 1 < frames; n += 2)
+    {
+        int32_t r0 = inFrames[n * 2 + 1];
+        int32_t r1 = inFrames[(n + 1) * 2 + 1];
+
+        mic48[oi++] = 0.5f * (
+            (float)r0 / 2147483647.0f +
+            (float)r1 / 2147483647.0f
+        );
+    }
+
+    if (oi) micRbWrite(mic48.data(), oi);
+    static int dbg = 0;
+    if ((++dbg % 200) == 0) {
+    fprintf(stderr, "mic48[0]=%f oi=%zu head=%zu tail=%zu\n",
+           mic48[0], oi, micRbHead_, micRbTail_);
+    fflush(stderr);
+}
+}
+
+// ---------------------------------------
+
         // Some clients keep the TX stream open but stop writing audio when unkeyed.
         // Auto-unkey if no TX buffers have arrived for a short time.
         if (txActive_.load()) {
@@ -685,6 +774,8 @@ void SBITXDevice::rxThreadMain()
         for (int i = 0; i < got; i++)
         {
             float x = (float)inFrames[i * 2 + 0] / 2147483648.0f; // S32 -> [-1,1)
+            const float rg = rfGain_.load(std::memory_order_relaxed);
+            x *= rg;
             std::complex<float> nco(cosf((float)ph), sinf((float)ph));
             inIQ[i] = x * nco;
 
@@ -918,6 +1009,9 @@ int SBITXDevice::writeStream(
     {
         (void)ctrlSetPTT(true);
         txActive_.store(true, std::memory_order_relaxed);
+        //startRxThread();
+        micLoopRun_.store(true);
+        startMicLoopThread();
         // If operating split, retune LO to TX frequency now
         if (ctrlEnabled_) {
             const long long rf = g_txTuneHz.load(std::memory_order_relaxed);
@@ -943,6 +1037,9 @@ int SBITXDevice::writeStream(
         }
 
             txActive_.store(false);
+            micLoopRun_.store(false);
+            stopMicLoopThread();
+            
         }
 
 
@@ -983,6 +1080,7 @@ int SBITXDevice::writeStream(
 
 snd_pcm_uframes_t written = 0;
 
+    std::lock_guard<std::mutex> lock(pbMutex_);
 while (written < outFrames)
 {
     snd_pcm_sframes_t rc =
@@ -1006,4 +1104,246 @@ while (written < outFrames)
 }
 
 return (int)numElems;
+}
+
+// ---------------- Path B: piHPSDR AF/MIC via ALSA loopback ----------------
+bool SBITXDevice::openAfLoopCapture()
+{
+#ifndef __linux__
+    return false;
+#else
+    if (afLoopCapHandle_) return true;
+    int rc = snd_pcm_open(&afLoopCapHandle_, afLoopCapDev_.c_str(), SND_PCM_STREAM_CAPTURE, 0);
+    if (rc < 0) { SoapySDR::logf(SOAPY_SDR_WARNING, "AF loop CAP open failed (%s): %s", afLoopCapDev_.c_str(), snd_strerror(rc)); afLoopCapHandle_=nullptr; return false; }
+    snd_pcm_hw_params_t *hw; snd_pcm_hw_params_alloca(&hw);
+    snd_pcm_hw_params_any(afLoopCapHandle_, hw);
+    snd_pcm_hw_params_set_access(afLoopCapHandle_, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(afLoopCapHandle_, hw, SND_PCM_FORMAT_S32_LE);
+    snd_pcm_hw_params_set_channels(afLoopCapHandle_, hw, 2);
+    unsigned int rate=48000; snd_pcm_hw_params_set_rate_near(afLoopCapHandle_, hw, &rate, nullptr);
+    snd_pcm_uframes_t per=1000, buf=4000;
+    snd_pcm_hw_params_set_period_size_near(afLoopCapHandle_, hw, &per, nullptr);
+    snd_pcm_hw_params_set_buffer_size_near(afLoopCapHandle_, hw, &buf);
+    rc = snd_pcm_hw_params(afLoopCapHandle_, hw);
+    if (rc < 0) { SoapySDR::logf(SOAPY_SDR_WARNING, "AF loop CAP hwparams failed: %s", snd_strerror(rc)); snd_pcm_close(afLoopCapHandle_); afLoopCapHandle_=nullptr; return false; }
+    snd_pcm_prepare(afLoopCapHandle_);
+    return true;
+#endif
+}
+void SBITXDevice::closeAfLoopCapture(){ if(!afLoopCapHandle_) return; snd_pcm_drop(afLoopCapHandle_); snd_pcm_close(afLoopCapHandle_); afLoopCapHandle_=nullptr; }
+
+bool SBITXDevice::openMicLoopPlayback()
+{
+#ifndef __linux__
+    return false;
+#else
+    if (micLoopPbHandle_) return true;
+    int rc = snd_pcm_open(&micLoopPbHandle_, micLoopPbDev_.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
+    fprintf(stderr, "openMicLoopPlayback dev=%s rc=%d (%s)\n", micLoopPbDev_.c_str(), rc, snd_strerror(rc));
+    fflush(stderr);
+    if (rc < 0) { SoapySDR::logf(SOAPY_SDR_WARNING, "MIC loop PB open failed (%s): %s", micLoopPbDev_.c_str(), snd_strerror(rc)); micLoopPbHandle_=nullptr; return false; }
+    snd_pcm_hw_params_t *hw; snd_pcm_hw_params_alloca(&hw);
+    snd_pcm_hw_params_any(micLoopPbHandle_, hw);
+    snd_pcm_hw_params_set_access(micLoopPbHandle_, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(micLoopPbHandle_, hw, SND_PCM_FORMAT_FLOAT_LE);
+    snd_pcm_hw_params_set_channels(micLoopPbHandle_, hw, 2);
+    unsigned int rate=48000; snd_pcm_hw_params_set_rate_near(micLoopPbHandle_, hw, &rate, nullptr);
+    snd_pcm_uframes_t per=64, buf=512;
+    snd_pcm_hw_params_set_period_size_near(micLoopPbHandle_, hw, &per, nullptr);
+    snd_pcm_hw_params_set_buffer_size_near(micLoopPbHandle_, hw, &buf);
+    rc = snd_pcm_hw_params(micLoopPbHandle_, hw);
+    if (rc < 0) { SoapySDR::logf(SOAPY_SDR_WARNING, "MIC loop PB hwparams failed: %s", snd_strerror(rc)); snd_pcm_close(micLoopPbHandle_); micLoopPbHandle_=nullptr; return false; }
+    snd_pcm_prepare(micLoopPbHandle_);
+    return true;
+#endif
+}
+void SBITXDevice::closeMicLoopPlayback(){ if(!micLoopPbHandle_) return; snd_pcm_drop(micLoopPbHandle_); snd_pcm_close(micLoopPbHandle_); micLoopPbHandle_=nullptr; }
+
+void SBITXDevice::afLoopThreadMain()
+{
+#ifndef __linux__
+    return;
+#else
+    if (!openAlsaPlayback()) return;
+    if (!openAfLoopCapture()) return;
+    const snd_pcm_uframes_t N48 = 64;
+    std::vector<int32_t> in((size_t)N48*2);
+    std::vector<int32_t> out((size_t)N48*2*2);
+    while (afLoopRun_.load())
+    {
+        if (txActive_.load(std::memory_order_relaxed)) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+        snd_pcm_sframes_t rd = snd_pcm_readi(afLoopCapHandle_, in.data(), N48);
+        if (rd < 0) { (void)snd_pcm_recover(afLoopCapHandle_, (int)rd, 1); continue; }
+        size_t got=(size_t)rd; size_t o=0;
+        float g = afGain_.load(std::memory_order_relaxed);
+        for(size_t i=0;i<got;i++){
+            float L=(float)in[i*2+0]/2147483647.0f;
+            float R=(float)in[i*2+1]/2147483647.0f;
+            float m=0.5f*(L+R)*g;
+            int32_t s=float_to_s32(m);
+            out[o++]=s; out[o++]=0; out[o++]=s; out[o++]=0;
+        }
+        snd_pcm_uframes_t frames96=(snd_pcm_uframes_t)(got*2);
+        std::lock_guard<std::mutex> lock(pbMutex_);
+        snd_pcm_sframes_t wr=snd_pcm_writei(pbHandle_, out.data(), frames96);
+        if (wr < 0) (void)snd_pcm_recover(pbHandle_, (int)wr, 1);
+    }
+#endif
+}
+void SBITXDevice::startAfLoopThread(){ if(afLoopRun_.exchange(true)) return; afLoopThread_ = std::thread(&SBITXDevice::afLoopThreadMain, this); }
+void SBITXDevice::stopAfLoopThread(){ if(!afLoopRun_.exchange(false)) return; if(afLoopThread_.joinable()) afLoopThread_.join(); closeAfLoopCapture(); }
+
+void SBITXDevice::txWrite(const float *iq_interleaved, size_t n){ txRbWrite(iq_interleaved, n); }
+void SBITXDevice::txRbWrite(const float *iq_interleaved, size_t n){
+    if(!iq_interleaved || n==0) return;
+    static std::vector<std::complex<float>> tmp;
+    tmp.resize(n);
+    for(size_t i=0;i<n;i++) tmp[i] = std::complex<float>(iq_interleaved[i*2+0], iq_interleaved[i*2+1]);
+    const void* bufs[1]; bufs[0]=(const void*)tmp.data();
+    int flags=0;
+    (void)this->writeStream(nullptr, bufs, n, flags, 0, 0);
+}
+
+// ---------------- MIC loopback support (codec MIC -> loopback) ----------------
+void SBITXDevice::micRbWrite(const float *in, size_t n)
+{
+    std::lock_guard<std::mutex> lock(micRbMtx_);
+
+    for (size_t i = 0; i < n; i++)
+    {
+        micRb_[micRbHead_] = in[i];
+        micRbHead_ = (micRbHead_ + 1) % micRbSize_;
+
+        // If buffer is full, drop oldest
+        if (micRbHead_ == micRbTail_)
+            micRbTail_ = (micRbTail_ + 1) % micRbSize_;
+    }
+}
+
+size_t SBITXDevice::micRbRead(float *out, size_t n)
+{
+    std::lock_guard<std::mutex> lock(micRbMtx_);
+
+    const size_t avail = (micRbHead_ + micRbSize_ - micRbTail_) % micRbSize_;
+    const size_t take  = std::min(n, avail);
+
+    for (size_t i = 0; i < take; i++)
+    {
+        out[i] = micRb_[micRbTail_];
+        micRbTail_ = (micRbTail_ + 1) % micRbSize_;
+    }
+    return take;
+}
+
+void SBITXDevice::startMicLoopThread()
+{
+    bool was = micLoopRun_.exchange(true);
+    fprintf(stderr, "startMicLoopThread called: was=%d\n", was ? 1 : 0);
+    fflush(stderr);
+    if (was) return;
+
+    micLoopThread_ = std::thread(&SBITXDevice::micLoopThreadMain, this);
+}
+
+void SBITXDevice::stopMicLoopThread()
+{
+    if (!micLoopRun_.exchange(false)) return;
+    if (micLoopThread_.joinable()) micLoopThread_.join();
+    closeMicLoopPlayback();
+}
+
+void SBITXDevice::micLoopThreadMain()
+{
+    fprintf(stderr, "micLoopThreadMain entered\n");
+    fflush(stderr);
+const float mic_gain = 0.1f;
+#ifndef __linux__
+    micLoopRun_.store(false);
+    return;
+#else
+    const size_t N = 64;                 // 48k frames per chunk
+    std::vector<float> outF(N * 2);       // stereo float for loopback
+    std::vector<float> mic(N);            // mono mic from ringbuffer
+
+    bool pbOpen = false;
+
+    while (micLoopRun_.load())
+    {
+        // Only run during TX
+        if (!txActive_.load(std::memory_order_relaxed))
+        {
+            if (pbOpen)
+            {
+                closeMicLoopPlayback();
+                pbOpen = false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // Open loopback playback lazily on TX
+        if (!pbOpen)
+        {
+            if (!openMicLoopPlayback())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            pbOpen = true;
+        }
+
+        // Absolute safety: never write if handle is invalid
+        if (!micLoopPbHandle_)
+        {
+            pbOpen = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        size_t got = micRbRead(mic.data(), N);
+
+        if (got == 0)
+        {
+            std::fill(outF.begin(), outF.end(), 0.0f);
+            got = N;
+        }
+        else
+        {
+            for (size_t i = 0; i < got; i++)
+            {
+                float s = mic[i] * mic_gain;
+
+            // soft clamp to avoid hard digital clipping
+            if (s > 1.0f)  s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+
+            outF[i*2 + 0] = s;
+            outF[i*2 + 1] = s;
+            }
+            for (size_t i = got; i < N; i++)
+            {
+                outF[i*2 + 0] = 0.0f;
+                outF[i*2 + 1] = 0.0f;
+            }
+        }
+
+        snd_pcm_sframes_t wr =
+            snd_pcm_writei(micLoopPbHandle_, outF.data(), (snd_pcm_uframes_t)got);
+
+        if (wr < 0)
+        {
+            wr = snd_pcm_recover(micLoopPbHandle_, (int)wr, 1);
+            if (wr < 0)
+            {
+                // if recovery fails, close and re-open next loop
+                closeMicLoopPlayback();
+                pbOpen = false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+    }
+
+    if (pbOpen) closeMicLoopPlayback();
+    micLoopRun_.store(false);
+#endif
 }
