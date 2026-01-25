@@ -32,6 +32,234 @@
 
 #include "sbitx_core.h"
 
+/* ---------------- ALSA coarse band trims (Master/Capture) ----------------
+ * Optional: load /etc/sbitx/alsamix_bands.ini (or ./alsamix_bands.ini).
+ * Applies coarse ALSA mixer settings on band change and PTT transitions.
+ * Only touches:
+ *   - 'Master'  (0..127)  : coarse TX IF drive (and/or RX speaker baseline)
+ *   - 'Capture' (0..31)   : coarse RX IF / mic (line) level
+ */
+
+typedef struct {
+    long long min_hz;
+    long long max_hz;
+    int rx_master;
+    int rx_capture;
+    int tx_master;
+    int tx_capture;
+    char name[32];
+} band_cfg_t;
+
+#define MAX_BANDS 32
+
+typedef struct {
+    char card[32];          /* amixer -c <card> */
+    int has_input_mux;
+    char input_mux[32];
+
+    int rx_master_def;
+    int rx_capture_def;
+    int tx_master_def;
+    int tx_capture_def;
+
+    int nbands;
+    band_cfg_t bands[MAX_BANDS];
+} alsa_cfg_t;
+
+static alsa_cfg_t g_alsa_cfg;
+static int g_alsa_loaded = 0;
+
+/* cache last applied values to avoid spamming amixer */
+static int g_last_master = -9999;
+static int g_last_capture = -9999;
+static int g_last_ptt = -1;
+static int g_last_band = -2;
+
+static long long current_freq = 0;
+static int ptt_state = 0;
+
+static void strtrim(char *s)
+{
+    if (!s) return;
+    char *p = s;
+    while (*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+    if (p != s) memmove(s, p, strlen(p)+1);
+    size_t n = strlen(s);
+    while (n>0 && (s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) {
+        s[n-1]=0; n--;
+    }
+}
+
+static int clampi(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void amixer_set(const char *ctl, int val)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "amixer -q -c %s sset '%s' %d",
+             g_alsa_cfg.card[0] ? g_alsa_cfg.card : "audioinjectorpi",
+             ctl, val);
+    (void)system(cmd);
+}
+
+static int find_band(long long hz)
+{
+    for (int i = 0; i < g_alsa_cfg.nbands; i++) {
+        if (hz >= g_alsa_cfg.bands[i].min_hz && hz <= g_alsa_cfg.bands[i].max_hz)
+            return i;
+    }
+    return -1;
+}
+
+static void apply_profile(int ptt_on, long long hz)
+{
+    if (!g_alsa_loaded) return;
+
+    int b = find_band(hz);
+
+    int want_master = ptt_on ? g_alsa_cfg.tx_master_def : g_alsa_cfg.rx_master_def;
+    int want_capture = ptt_on ? g_alsa_cfg.tx_capture_def : g_alsa_cfg.rx_capture_def;
+
+    if (b >= 0) {
+        const band_cfg_t *bc = &g_alsa_cfg.bands[b];
+        want_master  = ptt_on ? bc->tx_master  : bc->rx_master;
+        want_capture = ptt_on ? bc->tx_capture : bc->rx_capture;
+    }
+
+    want_master = clampi(want_master, 0, 127);
+    want_capture = clampi(want_capture, 0, 31);
+
+    if (g_last_master == want_master && g_last_capture == want_capture &&
+        g_last_ptt == ptt_on && g_last_band == b)
+        return;
+
+    g_last_master = want_master;
+    g_last_capture = want_capture;
+    g_last_ptt = ptt_on;
+    g_last_band = b;
+
+    if (g_alsa_cfg.has_input_mux && g_alsa_cfg.input_mux[0]) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "amixer -q -c %s cset name='Input Mux' '%s' >/dev/null 2>&1",
+                 g_alsa_cfg.card[0] ? g_alsa_cfg.card : "audioinjectorpi",
+                 g_alsa_cfg.input_mux);
+        (void)system(cmd);
+        g_alsa_cfg.has_input_mux = 0;
+    }
+
+    amixer_set("Capture", want_capture);
+    amixer_set("Master", want_master);
+}
+
+static int parse_kv(char *line, char *key, size_t ksz, char *val, size_t vsz)
+{
+    char *eq = strchr(line, '=');
+    if (!eq) return 0;
+    *eq = 0;
+    strncpy(key, line, ksz-1); key[ksz-1]=0;
+    strncpy(val, eq+1, vsz-1); val[vsz-1]=0;
+    strtrim(key);
+    strtrim(val);
+    return key[0] != 0;
+}
+
+static int alsa_cfg_load_file(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+
+    memset(&g_alsa_cfg, 0, sizeof(g_alsa_cfg));
+    strncpy(g_alsa_cfg.card, "audioinjectorpi", sizeof(g_alsa_cfg.card)-1);
+
+    g_alsa_cfg.rx_master_def = 70;
+    g_alsa_cfg.rx_capture_def = 21;
+    g_alsa_cfg.tx_master_def = 90;
+    g_alsa_cfg.tx_capture_def = 26;
+
+    char section[64] = "global";
+    band_cfg_t cur; memset(&cur, 0, sizeof(cur));
+    int in_band = 0;
+
+    char buf[256];
+    while (fgets(buf, sizeof(buf), fp)) {
+        char *c = strchr(buf, '#'); if (c) *c = 0;
+        c = strchr(buf, ';'); if (c) *c = 0;
+        strtrim(buf);
+        if (buf[0] == 0) continue;
+
+        if (buf[0] == '[') {
+            if (in_band && g_alsa_cfg.nbands < MAX_BANDS) {
+                g_alsa_cfg.bands[g_alsa_cfg.nbands++] = cur;
+            }
+            in_band = 0;
+            memset(&cur, 0, sizeof(cur));
+
+            char *r = strchr(buf, ']');
+            if (!r) continue;
+            *r = 0;
+            strncpy(section, buf+1, sizeof(section)-1);
+            section[sizeof(section)-1]=0;
+            strtrim(section);
+
+            if (strncmp(section, "band", 4) == 0) {
+                in_band = 1;
+                strncpy(cur.name, section, sizeof(cur.name)-1);
+                cur.rx_master = g_alsa_cfg.rx_master_def;
+                cur.rx_capture = g_alsa_cfg.rx_capture_def;
+                cur.tx_master = g_alsa_cfg.tx_master_def;
+                cur.tx_capture = g_alsa_cfg.tx_capture_def;
+            }
+            continue;
+        }
+
+        char key[64], val[128], tmp[256];
+        strncpy(tmp, buf, sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
+        if (!parse_kv(tmp, key, sizeof(key), val, sizeof(val))) continue;
+
+        if (!in_band) {
+            if (!strcmp(key, "card")) strncpy(g_alsa_cfg.card, val, sizeof(g_alsa_cfg.card)-1);
+            else if (!strcmp(key, "input_mux")) { g_alsa_cfg.has_input_mux=1; strncpy(g_alsa_cfg.input_mux, val, sizeof(g_alsa_cfg.input_mux)-1); }
+            else if (!strcmp(key, "rx_master")) g_alsa_cfg.rx_master_def = atoi(val);
+            else if (!strcmp(key, "rx_capture")) g_alsa_cfg.rx_capture_def = atoi(val);
+            else if (!strcmp(key, "tx_master")) g_alsa_cfg.tx_master_def = atoi(val);
+            else if (!strcmp(key, "tx_capture")) g_alsa_cfg.tx_capture_def = atoi(val);
+        } else {
+            if (!strcmp(key, "min_hz")) cur.min_hz = atoll(val);
+            else if (!strcmp(key, "max_hz")) cur.max_hz = atoll(val);
+            else if (!strcmp(key, "rx_master")) cur.rx_master = atoi(val);
+            else if (!strcmp(key, "rx_capture")) cur.rx_capture = atoi(val);
+            else if (!strcmp(key, "tx_master")) cur.tx_master = atoi(val);
+            else if (!strcmp(key, "tx_capture")) cur.tx_capture = atoi(val);
+        }
+    }
+
+    if (in_band && g_alsa_cfg.nbands < MAX_BANDS) g_alsa_cfg.bands[g_alsa_cfg.nbands++] = cur;
+
+    fclose(fp);
+
+    for (int i=0;i<g_alsa_cfg.nbands;i++){
+        if (g_alsa_cfg.bands[i].min_hz <= 0 || g_alsa_cfg.bands[i].max_hz <= 0 ||
+            g_alsa_cfg.bands[i].max_hz < g_alsa_cfg.bands[i].min_hz) {
+            for (int j=i+1;j<g_alsa_cfg.nbands;j++) g_alsa_cfg.bands[j-1]=g_alsa_cfg.bands[j];
+            g_alsa_cfg.nbands--; i--;
+        }
+    }
+
+    g_alsa_loaded = 1;
+    return 1;
+}
+
+static void alsa_cfg_try_load(void)
+{
+    if (g_alsa_loaded) return;
+    if (alsa_cfg_load_file("/etc/sbitx/alsamix_bands.ini")) return;
+    (void)alsa_cfg_load_file("alsamix_bands.ini");
+}
+
 #define LISTEN_IP   "127.0.0.1"
 #define LISTEN_PORT 9999
 
@@ -133,6 +361,7 @@ static void *client_thread(void *arg)
             pthread_mutex_lock(&g_lock);
             uint32_t hz = get_freq_locked();
             pthread_mutex_unlock(&g_lock);
+            current_freq = (long long)hz;
             replyf(fp, "%u\n", hz);
             continue;
         }
@@ -175,12 +404,18 @@ static void *client_thread(void *arg)
                 pthread_mutex_lock(&g_lock);
                 set_ptt_locked(1);
                 pthread_mutex_unlock(&g_lock);
+                ptt_state = 1;
+                alsa_cfg_try_load();
+                apply_profile(ptt_state, current_freq);
                 replyf(fp, "OK\n");
                 continue;
             } else if (*p == '0') {
                 pthread_mutex_lock(&g_lock);
                 set_ptt_locked(0);
                 pthread_mutex_unlock(&g_lock);
+                ptt_state = 0;
+                alsa_cfg_try_load();
+                apply_profile(ptt_state, current_freq);
                 replyf(fp, "OK\n");
                 continue;
             } else {
