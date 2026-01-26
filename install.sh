@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # ------------------------------------------------
 # sBitx + SoapySDR + piHPSDR Full Install Script
@@ -112,6 +113,7 @@ make -j$(nproc)
 ###############################################################################
 # FINAL
 ###############################################################################
+sudo chmod +x /sbitx-core_mod/sbitx_ini_gui.py
 echo
 echo "=== Installation complete ==="
 echo "* sbitx_ctrl binary location: sbitx-core_mod/sbitx_ctrl"
