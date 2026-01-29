@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # ------------------------------------------------
 # sBitx + SoapySDR + piHPSDR Full Install Script
@@ -79,17 +80,16 @@ else
     cd pihpsdr
 fi
 
-cat <<EOF > Makefile.config
-GPIO=ON
-MIDI=ON
-SATURN=OFF
-USBOZY=OFF
-SOAPYSDR=ON
-STEMLAB=OFF
-AUDIO=ALSA
-NR34LIB=OFF
-TTS=OFF
-EOF
+echo "=== Patching piHPSDR Makefile ==="
+sed -i 's/^GPIO *=.*/GPIO=ON/' Makefile
+sed -i 's/^MIDI *=.*/MIDI=ON/' Makefile
+sed -i 's/^SATURN *=.*/SATURN=OFF/' Makefile
+sed -i 's/^USBOZY *=.*/USBOZY=OFF/' Makefile
+sed -i 's/^SOAPYSDR *=.*/SOAPYSDR=ON/' Makefile
+sed -i 's/^STEMLAB *=.*/STEMLAB=OFF/' Makefile
+sed -i 's/^AUDIO *=.*/AUDIO=ALSA/' Makefile
+sed -i 's/^NR34LIB *=.*/NR34LIB=OFF/' Makefile
+sed -i 's/^TTS *=.*/TTS=OFF/' Makefile
 
 echo "=== Copying props files ==="
 cp "$INSTALL_HOME/sbitx-soapy/pihpsdr_files/gpio.props" .
@@ -108,11 +108,12 @@ sed -i \
     src/sliders.c
 
 echo "=== Building piHPSDR ==="
-make -C src -j$(nproc)
+make -j$(nproc)
 
 ###############################################################################
 # FINAL
 ###############################################################################
+sudo chmod +x /sbitx-core_mod/sbitx_ini_gui.py
 echo
 echo "=== Installation complete ==="
 echo "* sbitx_ctrl binary location: sbitx-core_mod/sbitx_ctrl"

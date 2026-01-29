@@ -4,7 +4,7 @@
 Version=1.0
 Type=Application
 Terminal=false
-Name[eb_GB]=Sbitx_Ctrl
+Name[eb_GB]=pihpsdr
 Exec=/home/pi/pihpsdr/pihpsdr
 Icon=/home/pi/pihpsdr/release/pihpsdr/piHPSDR_logo.png
 Name=Sbitx CTRL
