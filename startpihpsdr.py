@@ -56,7 +56,7 @@ class SbitxLauncher(tk.Tk):
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=10)
 
-        self.start_btn = ttk.Button(btn_frame, text="Start sbitx + pihpsdr", command=self.start_both)
+        self.start_btn = ttk.Button(btn_frame, text="Start sbitxCTRL + pihpsdr", command=self.start_both)
         self.start_btn.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
         self.stop_btn = ttk.Button(btn_frame, text="Stop / Cleanup", command=self.stop_both, state="disabled")
