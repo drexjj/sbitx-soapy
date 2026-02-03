@@ -8,7 +8,7 @@ Based on on work from Juan WP3DN, Dave N1AI, Mike KB2ML, JJ W9JES, and Rafael PU
 
 Clone this repo with:
 ```console
-cd ~ && git clone https://github.com/drexjj/sbitx-soapy && cd sbitx-soapy && chmod +x install.sh && ./install.sh
+cd ~ && git clone https://github.com/drexjj/sbitx-soapy && cd sbitx-soapy && ./install.sh
 ```
 
 The run `startpihpsdr.py`
