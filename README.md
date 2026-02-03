@@ -12,3 +12,6 @@ cd ~ && git clone https://github.com/drexjj/sbitx-soapy && cd sbitx-soapy && ./i
 ```
 
 The run `startpihpsdr.py` from the **/home/pi/sbitx-soapy** folder.
+
+
+There is also a configuration script at **/home/pi/sbitx-soapy/sbitx-core_mod/sbitx_ini_gui.py** to adjust your TX output for the bands.
