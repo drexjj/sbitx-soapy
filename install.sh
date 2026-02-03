@@ -48,6 +48,7 @@ gcc -O2 -pthread -o sbitx_ctrl \
     -lwiringPi -li2c
 
 echo "=== Installing sbitx ALSA band config ==="
+sudo chmod +x sbitx_ini_gui.py
 sudo mkdir -p /etc/sbitx
 sudo cp alsamix_bands.ini /etc/sbitx/
 
@@ -113,7 +114,6 @@ make -j$(nproc)
 ###############################################################################
 # FINAL
 ###############################################################################
-sudo chmod +x ./sbitx-core_mod/sbitx_ini_gui.py
 echo
 echo "=== Installation complete ==="
 echo "* sbitx_ctrl binary location: sbitx-core_mod/sbitx_ctrl"
