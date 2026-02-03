@@ -11,4 +11,4 @@ Clone this repo with:
 cd ~ && git clone https://github.com/drexjj/sbitx-soapy && cd sbitx-soapy && ./install.sh
 ```
 
-The run `startpihpsdr.py` from the /home/pi/sbitx-soapy folder.
+The run `startpihpsdr.py` from the **/home/pi/sbitx-soapy** folder.
